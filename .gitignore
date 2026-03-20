@@ -1,3 +1,5 @@
 bin/
 dist/
 SatoChip-*.cap
+__pycache__/
+*.pyc
