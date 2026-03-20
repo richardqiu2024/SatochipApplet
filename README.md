@@ -104,6 +104,8 @@ The current branch also contains Ed25519 and SLIP-0010 integration work that was
 Detailed notes for this branch are recorded in:
 
 - `docs/ED25519_INTEGRATION.md`
+- `docs/ESP32_WALLET_PLATFORM_PLAN.md`
+- `TODO.md`
 
 Relevant helper scripts:
 

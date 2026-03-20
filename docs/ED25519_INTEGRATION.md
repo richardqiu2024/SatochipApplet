@@ -9,7 +9,8 @@ This document records the current Ed25519 and SLIP-0010 integration work for `Sa
 - Output CAP: `SatoChip-3.0.4.cap`
 - Applet AID: `5361746F4368697000`
 - Package AID: `5361746F43686970`
-- Current applet minor version: `0.10`
+- Current protocol version: `0.12`
+- Current applet version from `GET_STATUS`: `0.10`
   Source: [CardEdge.java](../src/org/satochip/applet/CardEdge.java)
 
 The Ed25519 service is lazily initialized and now reuses the applet `recvBuffer` as its work buffer instead of allocating extra byte arrays at startup.
@@ -21,6 +22,24 @@ Relevant sources:
 - [Slip10Ed25519.java](../src/org/satochip/applet/Slip10Ed25519.java)
 - [test_ed25519.py](../scripts/test_ed25519.py)
 - [test_satochip_regression.py](../scripts/test_satochip_regression.py)
+
+## Frozen baseline
+
+The current platform baseline for follow-on `ESP32 + SatochipApplet` work is:
+
+- Git commit: `02ed3d5356fd94f3c76810682a66054e19b3fb3b`
+- CAP file: `SatoChip-3.0.4.cap`
+- CAP SHA-256: `22E4A2E4AF9A14BF46C4AE19AA1FCAC15B7C48CDE474A22AC2ECFEE61BBE6A9C`
+
+This baseline is the known-good applet state to use before starting `ESP32`-side transport, `BIP39`, Bitcoin, and Solana integration work.
+
+Validation status recorded for this baseline:
+
+- CAP install succeeded on the target card
+- Ed25519 smoke test passed on a real card
+- Combined legacy Satochip plus Ed25519 regression passed on a real card
+
+If a future applet change breaks platform work, compare against this baseline first.
 
 ## Build
 

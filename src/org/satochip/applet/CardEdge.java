@@ -1130,6 +1130,7 @@ public class CardEdge extends javacard.framework.Applet {
         bip32_seeded= false;
         bip32_masterkey.clearKey(); 
         bip32_masterchaincode.clearKey();
+        invalidateBIP32ExtendedKey();
         
         // reset trusted pubkey (for secure import from SeedKeeper)
         if (is_trusted_pubkey) {
@@ -1175,6 +1176,23 @@ public class CardEdge extends javacard.framework.Applet {
         ed25519_masterchaincode.getKey(recvBuffer, Slip10Ed25519.KEY_SIZE);
         Slip10Ed25519.derivePath(recvBuffer, (short) 0, pathBuffer, pathOffset, depth);
         ed25519_service.loadSeed(recvBuffer, (short) 0);
+    }
+
+    private void clearBIP32ImportState() {
+        Util.arrayFillNonAtomic(recvBuffer, (short) 0, (short) 128, (byte) 0x00);
+    }
+
+    private void clearBIP32DerivationState() {
+        Util.arrayFillNonAtomic(recvBuffer, BIP32_OFFSET_PARENT_CHAINCODE, BIP32_OFFSET_END, (byte) 0x00);
+    }
+
+    private void invalidateBIP32ExtendedKey() {
+        if (bip32_extendedkey != null)
+            bip32_extendedkey.clearKey();
+    }
+
+    private boolean hasValidBIP32ExtendedKey() {
+        return (bip32_extendedkey != null) && bip32_extendedkey.isInitialized();
     }
 
     private void clearEd25519WorkState() {
@@ -1756,23 +1774,29 @@ public class CardEdge extends javacard.framework.Applet {
             ISOException.throwIt(SW_INCORRECT_P2);
         if (ed25519_seeded)
             ISOException.throwIt(SW_ED25519_INITIALIZED_SEED);
-        ensureEd25519Service();
 
-        short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
-        short seedSize = (short) (buffer[ISO7816.OFFSET_P1] & 0xFF);
-        if (seedSize < (short) 16 || seedSize > (short) 64 || bytesLeft != seedSize)
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        short responseSize = 0;
+        try {
+            ensureEd25519Service();
 
-        Slip10Ed25519.deriveMaster(buffer, ISO7816.OFFSET_CDATA, seedSize, recvBuffer, (short) 0);
-        ed25519_masterkey.setKey(recvBuffer, (short) 0);
-        ed25519_masterchaincode.setKey(recvBuffer, Slip10Ed25519.KEY_SIZE);
-        ed25519_seeded = true;
+            short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
+            short seedSize = (short) (buffer[ISO7816.OFFSET_P1] & 0xFF);
+            if (seedSize < (short) 16 || seedSize > (short) 64 || bytesLeft != seedSize)
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
 
-        ed25519_service.loadSeed(recvBuffer, (short) 0);
-        short pubkeySize = ed25519_service.getPublicKey(buffer, (short) 2);
-        Util.setShort(buffer, (short) 0, pubkeySize);
-        clearEd25519WorkState();
-        return (short) (pubkeySize + 2);
+            Slip10Ed25519.deriveMaster(buffer, ISO7816.OFFSET_CDATA, seedSize, recvBuffer, (short) 0);
+            ed25519_masterkey.setKey(recvBuffer, (short) 0);
+            ed25519_masterchaincode.setKey(recvBuffer, Slip10Ed25519.KEY_SIZE);
+            ed25519_seeded = true;
+
+            ed25519_service.loadSeed(recvBuffer, (short) 0);
+            short pubkeySize = ed25519_service.getPublicKey(buffer, (short) 2);
+            Util.setShort(buffer, (short) 0, pubkeySize);
+            responseSize = (short) (pubkeySize + 2);
+            return responseSize;
+        } finally {
+            clearEd25519WorkState();
+        }
     }
 
     /**
@@ -1844,24 +1868,30 @@ public class CardEdge extends javacard.framework.Applet {
             ISOException.throwIt(SW_INCORRECT_P2);
         if (!ed25519_seeded)
             ISOException.throwIt(SW_ED25519_UNINITIALIZED_SEED);
-        ensureEd25519Service();
 
-        byte depth = buffer[ISO7816.OFFSET_P1];
-        short depthValue = (short) (depth & 0xFF);
-        short pathSize = (short) (depthValue * 4);
-        short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
-        if (depthValue > Slip10Ed25519.MAX_PATH_DEPTH)
-            ISOException.throwIt(SW_INCORRECT_P1);
-        if (bytesLeft != pathSize)
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        if (!Slip10Ed25519.isHardenedPath(buffer, ISO7816.OFFSET_CDATA, depth))
-            ISOException.throwIt(SW_ED25519_INVALID_PATH);
+        short responseSize = 0;
+        try {
+            ensureEd25519Service();
 
-        loadEd25519PathToService(buffer, ISO7816.OFFSET_CDATA, depth);
-        short pubkeySize = ed25519_service.getPublicKey(buffer, (short) 2);
-        Util.setShort(buffer, (short) 0, pubkeySize);
-        clearEd25519WorkState();
-        return (short) (pubkeySize + 2);
+            byte depth = buffer[ISO7816.OFFSET_P1];
+            short depthValue = (short) (depth & 0xFF);
+            short pathSize = (short) (depthValue * 4);
+            short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
+            if (depthValue > Slip10Ed25519.MAX_PATH_DEPTH)
+                ISOException.throwIt(SW_INCORRECT_P1);
+            if (bytesLeft != pathSize)
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            if (!Slip10Ed25519.isHardenedPath(buffer, ISO7816.OFFSET_CDATA, depth))
+                ISOException.throwIt(SW_ED25519_INVALID_PATH);
+
+            loadEd25519PathToService(buffer, ISO7816.OFFSET_CDATA, depth);
+            short pubkeySize = ed25519_service.getPublicKey(buffer, (short) 2);
+            Util.setShort(buffer, (short) 0, pubkeySize);
+            responseSize = (short) (pubkeySize + 2);
+            return responseSize;
+        } finally {
+            clearEd25519WorkState();
+        }
     }
 
     /**
@@ -1880,47 +1910,53 @@ public class CardEdge extends javacard.framework.Applet {
             ISOException.throwIt(SW_INCORRECT_P2);
         if (!ed25519_seeded)
             ISOException.throwIt(SW_ED25519_UNINITIALIZED_SEED);
-        ensureEd25519Service();
 
-        byte depth = buffer[ISO7816.OFFSET_P1];
-        short depthValue = (short) (depth & 0xFF);
-        short pathSize = (short) (depthValue * 4);
-        short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
-        if (depthValue > Slip10Ed25519.MAX_PATH_DEPTH)
-            ISOException.throwIt(SW_INCORRECT_P1);
-        if (bytesLeft < (short) (pathSize + 2))
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        if (!Slip10Ed25519.isHardenedPath(buffer, ISO7816.OFFSET_CDATA, depth))
-            ISOException.throwIt(SW_ED25519_INVALID_PATH);
+        short responseSize = 0;
+        try {
+            ensureEd25519Service();
 
-        short msgSizeOffset = (short) (ISO7816.OFFSET_CDATA + pathSize);
-        short msgOffset = (short) (msgSizeOffset + 2);
-        short msgSize = Util.getShort(buffer, msgSizeOffset);
-        bytesLeft -= (short) (pathSize + 2);
-        if (msgSize < 0 || bytesLeft < msgSize)
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            byte depth = buffer[ISO7816.OFFSET_P1];
+            short depthValue = (short) (depth & 0xFF);
+            short pathSize = (short) (depthValue * 4);
+            short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
+            if (depthValue > Slip10Ed25519.MAX_PATH_DEPTH)
+                ISOException.throwIt(SW_INCORRECT_P1);
+            if (bytesLeft < (short) (pathSize + 2))
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            if (!Slip10Ed25519.isHardenedPath(buffer, ISO7816.OFFSET_CDATA, depth))
+                ISOException.throwIt(SW_ED25519_INVALID_PATH);
 
-        short hmacOffset = (short) (msgOffset + msgSize);
-        bytesLeft -= msgSize;
-        if (needs_2FA) {
-            if (bytesLeft != (short) 20)
+            short msgSizeOffset = (short) (ISO7816.OFFSET_CDATA + pathSize);
+            short msgOffset = (short) (msgSizeOffset + 2);
+            short msgSize = Util.getShort(buffer, msgSizeOffset);
+            bytesLeft -= (short) (pathSize + 2);
+            if (msgSize < 0 || bytesLeft < msgSize)
                 ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
 
-            sha256.reset();
-            sha256.doFinal(buffer, msgOffset, msgSize, recvBuffer, (short) 0);
-            Util.arrayFillNonAtomic(recvBuffer, (short) 32, (short) 32, (byte) 0xCC);
-            HmacSha160.computeHmacSha160(data2FA, OFFSET_2FA_HMACKEY, (short) 20, recvBuffer, (short) 0, (short) 64, recvBuffer, (short) 64);
-            if (Util.arrayCompare(buffer, hmacOffset, recvBuffer, (short) 64, (short) 20) != 0)
-                ISOException.throwIt(SW_SIGNATURE_INVALID);
-        } else if (bytesLeft != (short) 0) {
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        }
+            short hmacOffset = (short) (msgOffset + msgSize);
+            bytesLeft -= msgSize;
+            if (needs_2FA) {
+                if (bytesLeft != (short) 20)
+                    ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
 
-        loadEd25519PathToService(buffer, ISO7816.OFFSET_CDATA, depth);
-        short signatureSize = ed25519_service.sign(buffer, msgOffset, msgSize, buffer, (short) 2);
-        Util.setShort(buffer, (short) 0, signatureSize);
-        clearEd25519WorkState();
-        return (short) (signatureSize + 2);
+                sha256.reset();
+                sha256.doFinal(buffer, msgOffset, msgSize, recvBuffer, (short) 0);
+                Util.arrayFillNonAtomic(recvBuffer, (short) 32, (short) 32, (byte) 0xCC);
+                HmacSha160.computeHmacSha160(data2FA, OFFSET_2FA_HMACKEY, (short) 20, recvBuffer, (short) 0, (short) 64, recvBuffer, (short) 64);
+                if (Util.arrayCompare(buffer, hmacOffset, recvBuffer, (short) 64, (short) 20) != 0)
+                    ISOException.throwIt(SW_SIGNATURE_INVALID);
+            } else if (bytesLeft != (short) 0) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+
+            loadEd25519PathToService(buffer, ISO7816.OFFSET_CDATA, depth);
+            short signatureSize = ed25519_service.sign(buffer, msgOffset, msgSize, buffer, (short) 2);
+            Util.setShort(buffer, (short) 0, signatureSize);
+            responseSize = (short) (signatureSize + 2);
+            return responseSize;
+        } finally {
+            clearEd25519WorkState();
+        }
     }
 
     
@@ -1948,42 +1984,45 @@ public class CardEdge extends javacard.framework.Applet {
         // if already seeded, must call resetBIP32Seed first!
         if (bip32_seeded)
             ISOException.throwIt(SW_BIP32_INITIALIZED_SEED);
-        
-        short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
-        
-        // get seed bytesize (max 64 bytes)
-        byte bip32_seedsize = buffer[ISO7816.OFFSET_P1]; 
-        if (bip32_seedsize <0 || bip32_seedsize>64)
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        if (bytesLeft < bip32_seedsize)
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);      
-        
-        short offset= (short)ISO7816.OFFSET_CDATA;
-        
-        // derive master key!
-        HmacSha512.computeHmacSha512(BITCOIN_SEED, (short)0, (short)BITCOIN_SEED.length, buffer, offset, (short)bip32_seedsize, recvBuffer, (short)0);
-        bip32_masterkey.setKey(recvBuffer, (short)0); // data must be exactly 32 bytes long
-        bip32_masterchaincode.setKey(recvBuffer, (short)32); // data must be exactly 32 bytes long
-        
-        // bip32 is now seeded
-        bip32_seeded= true;
-        
-        // clear recvBuffer
-        Util.arrayFillNonAtomic(recvBuffer, (short)0, (short)128, (byte)0);
-        
-        // compute the partial authentikey public key...
-        authentikey_public.getW(buffer, (short)1);
-        Util.setShort(buffer, (short)0, BIP32_KEY_SIZE);
-        // self signed public key
-        sigECDSA.init(authentikey_private, Signature.MODE_SIGN);
-        short sign_size= sigECDSA.sign(buffer, (short)0, (short)(BIP32_KEY_SIZE+2), buffer, (short)(BIP32_KEY_SIZE+4));
-        Util.setShort(buffer, (short)(2+BIP32_KEY_SIZE), sign_size);
-        
-        // return x-coordinate of public key+signature
-        // the client can recover full public-key from the signature or
-        // by guessing the compression value () and verifying the signature... 
-        // buffer= [coordx_size(2) | coordx | sigsize(2) | sig]
-        return (short)(2+BIP32_KEY_SIZE+2+sign_size);
+
+        short responseSize = 0;
+        try {
+            short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
+            
+            // get seed bytesize (max 64 bytes)
+            byte bip32_seedsize = buffer[ISO7816.OFFSET_P1]; 
+            if (bip32_seedsize <0 || bip32_seedsize>64)
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            if (bytesLeft < bip32_seedsize)
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);      
+            
+            short offset= (short)ISO7816.OFFSET_CDATA;
+            
+            // derive master key!
+            HmacSha512.computeHmacSha512(BITCOIN_SEED, (short)0, (short)BITCOIN_SEED.length, buffer, offset, (short)bip32_seedsize, recvBuffer, (short)0);
+            bip32_masterkey.setKey(recvBuffer, (short)0); // data must be exactly 32 bytes long
+            bip32_masterchaincode.setKey(recvBuffer, (short)32); // data must be exactly 32 bytes long
+            
+            // bip32 is now seeded
+            bip32_seeded= true;
+            
+            // compute the partial authentikey public key...
+            authentikey_public.getW(buffer, (short)1);
+            Util.setShort(buffer, (short)0, BIP32_KEY_SIZE);
+            // self signed public key
+            sigECDSA.init(authentikey_private, Signature.MODE_SIGN);
+            short sign_size= sigECDSA.sign(buffer, (short)0, (short)(BIP32_KEY_SIZE+2), buffer, (short)(BIP32_KEY_SIZE+4));
+            Util.setShort(buffer, (short)(2+BIP32_KEY_SIZE), sign_size);
+            
+            // return x-coordinate of public key+signature
+            // the client can recover full public-key from the signature or
+            // by guessing the compression value () and verifying the signature... 
+            // buffer= [coordx_size(2) | coordx | sigsize(2) | sig]
+            responseSize = (short)(2+BIP32_KEY_SIZE+2+sign_size);
+            return responseSize;
+        } finally {
+            clearBIP32ImportState();
+        }
     }
     
     /**
@@ -2176,141 +2215,154 @@ public class CardEdge extends javacard.framework.Applet {
         byte opts = buffer[ISO7816.OFFSET_P2]; 
         if ((opts & 0x80)==0x80)
             bip32_om.reset();
-        
-        // master key data (usefull as parent's data for key derivation)
-        // The method uses a temporary buffer recvBuffer to store the parent and extended key object data:
-        // recvBuffer=[ parent_chain_code (32b) | 0x00 | parent_key (32b) | hash(address)(32b) | current_extended_key(32b) | current_chain_code(32b) | parent_pubkey(65b) | bip32_path(40b)]
-        // hash(address)= [ index(4b) | unused (16b)| crc (4b) | ANTICOLLISIONHASHTMP(4b)| ANTICOLLISIONHASH(4b)]
-        // parent_pubkey(65b)= [compression_byte(1b) | coord_x (32b) | coord_y(32b)]
-        bip32_masterchaincode.getKey(recvBuffer, BIP32_OFFSET_PARENT_CHAINCODE);
-        bip32_masterkey.getKey(recvBuffer,BIP32_OFFSET_PARENT_KEY);         
-        recvBuffer[BIP32_OFFSET_PARENT_SEPARATOR]=0x00; // separator, also facilitate HMAC derivation
-        Util.arrayCopyNonAtomic(buffer, ISO7816.OFFSET_CDATA, recvBuffer, BIP32_OFFSET_PATH, (short)(4*bip32_depth));
-        short parent_base=Bip32ObjectManager.NULL_OFFSET; 
-        
-        // iterate on indexes provided 
-        for (byte i=1; i<=bip32_depth; i++){
+
+        short responseSize = 0;
+        boolean success = false;
+        boolean derivationStateCleared = false;
+        try {
+            // master key data (usefull as parent's data for key derivation)
+            // The method uses a temporary buffer recvBuffer to store the parent and extended key object data:
+            // recvBuffer=[ parent_chain_code (32b) | 0x00 | parent_key (32b) | hash(address)(32b) | current_extended_key(32b) | current_chain_code(32b) | parent_pubkey(65b) | bip32_path(40b)]
+            // hash(address)= [ index(4b) | unused (16b)| crc (4b) | ANTICOLLISIONHASHTMP(4b)| ANTICOLLISIONHASH(4b)]
+            // parent_pubkey(65b)= [compression_byte(1b) | coord_x (32b) | coord_y(32b)]
+            bip32_masterchaincode.getKey(recvBuffer, BIP32_OFFSET_PARENT_CHAINCODE);
+            bip32_masterkey.getKey(recvBuffer,BIP32_OFFSET_PARENT_KEY);         
+            recvBuffer[BIP32_OFFSET_PARENT_SEPARATOR]=0x00; // separator, also facilitate HMAC derivation
+            Util.arrayCopyNonAtomic(buffer, ISO7816.OFFSET_CDATA, recvBuffer, BIP32_OFFSET_PATH, (short)(4*bip32_depth));
+            short parent_base=Bip32ObjectManager.NULL_OFFSET; 
+            
+            // iterate on indexes provided 
+            for (byte i=1; i<=bip32_depth; i++){
+                            
+                //compute SHA of the extended key address up to depth i (only the last bytes are actually used)
+                sha256.reset(); 
+                sha256.doFinal(recvBuffer, BIP32_OFFSET_PATH, (short)(i*4), recvBuffer, BIP32_OFFSET_INDEX);
+                short base=bip32_om.getBaseAddress(recvBuffer,BIP32_OFFSET_COLLISIONHASH);
+                // retrieve object at this address if it exists
+                if (base!=Bip32ObjectManager.NULL_OFFSET){
+                    bip32_om.getBytes(recvBuffer, BIP32_OFFSET_COLLISIONHASH, base, (short)0, BIP32_OBJECT_SIZE);
+                }
+                // otherwise, create object if no object was found
+                if (base==Bip32ObjectManager.NULL_OFFSET){
+                    
+                    // normal or hardened child?
+                    byte msb= recvBuffer[(short)(BIP32_OFFSET_PATH+4*(i-1))];
+                    if ((msb & 0x80)!=0x80){ // normal child
+                        // we must compute parent's compressed pubkey from privkey
+                        // check if parent's compression byte is available
+                        byte compbyte=0x04;//default
+                        if (parent_base==Bip32ObjectManager.NULL_OFFSET)
+                            compbyte=bip32_master_compbyte;
+                        else
+                            compbyte=bip32_om.getByte(parent_base, (short)(BIP32_OBJECT_SIZE-1));
                         
-            //compute SHA of the extended key address up to depth i (only the last bytes are actually used)
-            sha256.reset(); 
-            sha256.doFinal(recvBuffer, BIP32_OFFSET_PATH, (short)(i*4), recvBuffer, BIP32_OFFSET_INDEX);
-            short base=bip32_om.getBaseAddress(recvBuffer,BIP32_OFFSET_COLLISIONHASH);
-            // retrieve object at this address if it exists
-            if (base!=Bip32ObjectManager.NULL_OFFSET){
-                bip32_om.getBytes(recvBuffer, BIP32_OFFSET_COLLISIONHASH, base, (short)0, BIP32_OBJECT_SIZE);
-            }
-            // otherwise, create object if no object was found
-            if (base==Bip32ObjectManager.NULL_OFFSET){
-                
-                // normal or hardened child?
-                byte msb= recvBuffer[(short)(BIP32_OFFSET_PATH+4*(i-1))];
-                if ((msb & 0x80)!=0x80){ // normal child
-                    // we must compute parent's compressed pubkey from privkey
-                    // check if parent's compression byte is available
-                    byte compbyte=0x04;//default
-                    if (parent_base==Bip32ObjectManager.NULL_OFFSET)
-                        compbyte=bip32_master_compbyte;
-                    else
-                        compbyte=bip32_om.getByte(parent_base, (short)(BIP32_OBJECT_SIZE-1));
+                        // compute coord x from privkey 
+                        bip32_extendedkey.setS(recvBuffer, BIP32_OFFSET_PARENT_KEY, BIP32_KEY_SIZE);
+                        keyAgreement.init(bip32_extendedkey);
+                        
+                        // keyAgreement.generateSecret() recovers X and Y coordinates
+                        keyAgreement.generateSecret(Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_G, (short) 65, recvBuffer, BIP32_OFFSET_PUB); //pubkey in uncompressed form
+                        boolean parity= ((recvBuffer[(short)(BIP32_OFFSET_PUBY+31)]&0x01)==0);
+                        compbyte= (parity)?(byte)0x02:(byte)0x03; 
+                        // save compbyte in parent's object for future use
+                        if (parent_base==Bip32ObjectManager.NULL_OFFSET)
+                            bip32_master_compbyte= compbyte;
+                        else
+                            bip32_om.setByte(parent_base, (short)(BIP32_OBJECT_SIZE-1), compbyte);
                     
-                    // compute coord x from privkey 
-                    bip32_extendedkey.setS(recvBuffer, BIP32_OFFSET_PARENT_KEY, BIP32_KEY_SIZE);
-                    keyAgreement.init(bip32_extendedkey);
-                    
-                    // keyAgreement.generateSecret() recovers X and Y coordinates
-                    keyAgreement.generateSecret(Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_G, (short) 65, recvBuffer, BIP32_OFFSET_PUB); //pubkey in uncompressed form
-                    boolean parity= ((recvBuffer[(short)(BIP32_OFFSET_PUBY+31)]&0x01)==0);
-                    compbyte= (parity)?(byte)0x02:(byte)0x03; 
-                    // save compbyte in parent's object for future use
-                    if (parent_base==Bip32ObjectManager.NULL_OFFSET)
-                        bip32_master_compbyte= compbyte;
-                    else
-                        bip32_om.setByte(parent_base, (short)(BIP32_OBJECT_SIZE-1), compbyte);
-                
-                    // compute HMAC of compressed pubkey + index
-                    recvBuffer[BIP32_OFFSET_PUB]= compbyte;
-                    Util.arrayCopyNonAtomic(recvBuffer, (short)(BIP32_OFFSET_PATH+4*(i-1)), recvBuffer, BIP32_OFFSET_PUBY, (short)4);
-                    HmacSha512.computeHmacSha512(recvBuffer, BIP32_OFFSET_PARENT_CHAINCODE, BIP32_KEY_SIZE, recvBuffer, BIP32_OFFSET_PUB, (short)(1+BIP32_KEY_SIZE+4), recvBuffer, BIP32_OFFSET_CHILD_KEY);
-                }
-                else { // hardened child
-                    recvBuffer[BIP32_KEY_SIZE]= 0x00;
-                    Util.arrayCopyNonAtomic(recvBuffer, (short)(BIP32_OFFSET_PATH+4*(i-1)), recvBuffer, BIP32_OFFSET_INDEX, (short)4);
-                    HmacSha512.computeHmacSha512(recvBuffer, BIP32_OFFSET_PARENT_CHAINCODE, BIP32_KEY_SIZE, recvBuffer, BIP32_OFFSET_PARENT_SEPARATOR, (short)(1+BIP32_KEY_SIZE+4), recvBuffer, BIP32_OFFSET_CHILD_KEY);
-                }
-                
-                // addition with parent_key...
-                // First check that parse256(IL) < SECP256K1_R
-                if(!Biginteger.lessThan(recvBuffer, BIP32_OFFSET_CHILD_KEY, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, BIP32_KEY_SIZE)){
-                    ISOException.throwIt(SW_BIP32_DERIVATION_ERROR);
-                }
-                // add parent_key (mod SECP256K1_R)
-                if(Biginteger.add_carry(recvBuffer, BIP32_OFFSET_CHILD_KEY, recvBuffer, (short) (BIP32_KEY_SIZE+1), BIP32_KEY_SIZE)){
-                    // in case of final carry, we must substract SECP256K1_R
-                    // we have IL<SECP256K1_R and parent_key<SECP256K1_R, so IL+parent_key<2*SECP256K1_R
-                    Biginteger.subtract(recvBuffer, BIP32_OFFSET_CHILD_KEY, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, BIP32_KEY_SIZE); 
-                }else{
-                    // in the unlikely case where SECP256K1_R<=IL+parent_key<2^256
-                    if(!Biginteger.lessThan(recvBuffer, BIP32_OFFSET_CHILD_KEY, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, BIP32_KEY_SIZE)){
-                        Biginteger.subtract(recvBuffer, BIP32_OFFSET_CHILD_KEY, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, BIP32_KEY_SIZE);
+                        // compute HMAC of compressed pubkey + index
+                        recvBuffer[BIP32_OFFSET_PUB]= compbyte;
+                        Util.arrayCopyNonAtomic(recvBuffer, (short)(BIP32_OFFSET_PATH+4*(i-1)), recvBuffer, BIP32_OFFSET_PUBY, (short)4);
+                        HmacSha512.computeHmacSha512(recvBuffer, BIP32_OFFSET_PARENT_CHAINCODE, BIP32_KEY_SIZE, recvBuffer, BIP32_OFFSET_PUB, (short)(1+BIP32_KEY_SIZE+4), recvBuffer, BIP32_OFFSET_CHILD_KEY);
                     }
-                    // check that value is not 0
-                    if(Biginteger.equalZero(recvBuffer, BIP32_OFFSET_CHILD_KEY, BIP32_KEY_SIZE)){
+                    else { // hardened child
+                        recvBuffer[BIP32_KEY_SIZE]= 0x00;
+                        Util.arrayCopyNonAtomic(recvBuffer, (short)(BIP32_OFFSET_PATH+4*(i-1)), recvBuffer, BIP32_OFFSET_INDEX, (short)4);
+                        HmacSha512.computeHmacSha512(recvBuffer, BIP32_OFFSET_PARENT_CHAINCODE, BIP32_KEY_SIZE, recvBuffer, BIP32_OFFSET_PARENT_SEPARATOR, (short)(1+BIP32_KEY_SIZE+4), recvBuffer, BIP32_OFFSET_CHILD_KEY);
+                    }
+                    
+                    // addition with parent_key...
+                    // First check that parse256(IL) < SECP256K1_R
+                    if(!Biginteger.lessThan(recvBuffer, BIP32_OFFSET_CHILD_KEY, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, BIP32_KEY_SIZE)){
                         ISOException.throwIt(SW_BIP32_DERIVATION_ERROR);
                     }
-                }
+                    // add parent_key (mod SECP256K1_R)
+                    if(Biginteger.add_carry(recvBuffer, BIP32_OFFSET_CHILD_KEY, recvBuffer, (short) (BIP32_KEY_SIZE+1), BIP32_KEY_SIZE)){
+                        // in case of final carry, we must substract SECP256K1_R
+                        // we have IL<SECP256K1_R and parent_key<SECP256K1_R, so IL+parent_key<2*SECP256K1_R
+                        Biginteger.subtract(recvBuffer, BIP32_OFFSET_CHILD_KEY, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, BIP32_KEY_SIZE); 
+                    }else{
+                        // in the unlikely case where SECP256K1_R<=IL+parent_key<2^256
+                        if(!Biginteger.lessThan(recvBuffer, BIP32_OFFSET_CHILD_KEY, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, BIP32_KEY_SIZE)){
+                            Biginteger.subtract(recvBuffer, BIP32_OFFSET_CHILD_KEY, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, BIP32_KEY_SIZE);
+                        }
+                        // check that value is not 0
+                        if(Biginteger.equalZero(recvBuffer, BIP32_OFFSET_CHILD_KEY, BIP32_KEY_SIZE)){
+                            ISOException.throwIt(SW_BIP32_DERIVATION_ERROR);
+                        }
+                    }
+                    
+                    // encrypt privkey & chaincode
+                    aes128.init(bip32_encryptkey, Cipher.MODE_ENCRYPT);
+                    aes128.doFinal(recvBuffer, BIP32_OFFSET_CHILD_KEY, (short)(2*BIP32_KEY_SIZE), recvBuffer, BIP32_OFFSET_CHILD_KEY);
+                    
+                    // Update object data
+                    recvBuffer[BIP32_OFFSET_PUB]=0x04;
+                    // create object 
+                    // todo: should we create object for tx keys in last index (since they are usually used only once)?
+                    base= bip32_om.createObject(recvBuffer,BIP32_OFFSET_COLLISIONHASH);
+                    
+                }//end if (object creation)
                 
-                // encrypt privkey & chaincode
-                aes128.init(bip32_encryptkey, Cipher.MODE_ENCRYPT);
+                // at this point, recvBuffer contains a copy of the object related to extended key at depth i
+                // decrypt privkey & chaincode as they are encrypted at this point
+                aes128.init(bip32_encryptkey, Cipher.MODE_DECRYPT);
                 aes128.doFinal(recvBuffer, BIP32_OFFSET_CHILD_KEY, (short)(2*BIP32_KEY_SIZE), recvBuffer, BIP32_OFFSET_CHILD_KEY);
+                // copy privkey & chain code in parent's offset
+                Util.arrayCopyNonAtomic(recvBuffer, BIP32_OFFSET_CHILD_CHAINCODE, recvBuffer, BIP32_OFFSET_PARENT_CHAINCODE, BIP32_KEY_SIZE); // chaincode
+                Util.arrayCopyNonAtomic(recvBuffer, BIP32_OFFSET_CHILD_KEY, recvBuffer, BIP32_OFFSET_PARENT_KEY, BIP32_KEY_SIZE); // extended_key
+                recvBuffer[BIP32_KEY_SIZE]=0x00;
                 
-                // Update object data
-                recvBuffer[BIP32_OFFSET_PUB]=0x04;
-                // create object 
-                // todo: should we create object for tx keys in last index (since they are usually used only once)?
-                base= bip32_om.createObject(recvBuffer,BIP32_OFFSET_COLLISIONHASH);
-                
-            }//end if (object creation)
+                // update parent_base for next iteration
+                parent_base=base;           
+            } // end for
             
-            // at this point, recvBuffer contains a copy of the object related to extended key at depth i
-            // decrypt privkey & chaincode as they are encrypted at this point
-            aes128.init(bip32_encryptkey, Cipher.MODE_DECRYPT);
-            aes128.doFinal(recvBuffer, BIP32_OFFSET_CHILD_KEY, (short)(2*BIP32_KEY_SIZE), recvBuffer, BIP32_OFFSET_CHILD_KEY);
-            // copy privkey & chain code in parent's offset
-            Util.arrayCopyNonAtomic(recvBuffer, BIP32_OFFSET_CHILD_CHAINCODE, recvBuffer, BIP32_OFFSET_PARENT_CHAINCODE, BIP32_KEY_SIZE); // chaincode
-            Util.arrayCopyNonAtomic(recvBuffer, BIP32_OFFSET_CHILD_KEY, recvBuffer, BIP32_OFFSET_PARENT_KEY, BIP32_KEY_SIZE); // extended_key
-            recvBuffer[BIP32_KEY_SIZE]=0x00;
+            // at this point, recvBuffer contains a copy of the last extended key 
+            // instantiate elliptic curve with last extended key + copy ACL
+            bip32_extendedkey.setS(recvBuffer, BIP32_OFFSET_PARENT_KEY, BIP32_KEY_SIZE);
             
-            // update parent_base for next iteration
-            parent_base=base;           
-        } // end for
-        
-        // at this point, recvBuffer contains a copy of the last extended key 
-        // instantiate elliptic curve with last extended key + copy ACL
-        bip32_extendedkey.setS(recvBuffer, BIP32_OFFSET_PARENT_KEY, BIP32_KEY_SIZE);
-        
-        // save chaincode to buffer then clear recvBuffer
-        Util.arrayCopyNonAtomic(recvBuffer, (short)BIP32_OFFSET_PARENT_CHAINCODE, buffer, (short)0, BIP32_KEY_SIZE); 
-        Util.arrayFillNonAtomic(recvBuffer, BIP32_OFFSET_PARENT_CHAINCODE, BIP32_OFFSET_END, (byte)0);
-                
-        // compute the corresponding partial public key...
-        keyAgreement.init(bip32_extendedkey);
-        keyAgreement.generateSecret(Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_G, (short) 65, buffer, (short)33); //pubkey in uncompressed form
-        Util.setShort(buffer, BIP32_KEY_SIZE, BIP32_KEY_SIZE);
-        
-        // self-sign coordx
-        sigECDSA.init(bip32_extendedkey, Signature.MODE_SIGN);
-        short sign_size= sigECDSA.sign(buffer, (short)0, (short)(BIP32_KEY_SIZE+2+BIP32_KEY_SIZE), buffer, (short)(BIP32_KEY_SIZE+BIP32_KEY_SIZE+4));
-        Util.setShort(buffer, (short)(BIP32_KEY_SIZE+BIP32_KEY_SIZE+2), sign_size);
-        
-        // coordx signed by authentikey
-        sigECDSA.init(authentikey_private, Signature.MODE_SIGN);
-        short sign_size2= sigECDSA.sign(buffer, (short)0, (short)(BIP32_KEY_SIZE+BIP32_KEY_SIZE+sign_size+4), buffer, (short)(BIP32_KEY_SIZE+BIP32_KEY_SIZE+sign_size+6));
-        Util.setShort(buffer, (short)(BIP32_KEY_SIZE+BIP32_KEY_SIZE+sign_size+4), sign_size2);
-        
-        // return x-coordinate of public key+signatures
-        // the client can recover full public-key by guessing the compression value () and verifying the signature... 
-        // buffer=[chaincode(32) | coordx_size(2) | coordx | sign_size(2) | self-sign | sign_size(2) | auth_sign]
-        return (short)(BIP32_KEY_SIZE+BIP32_KEY_SIZE+sign_size+sign_size2+6);
+            // save chaincode to buffer then clear recvBuffer
+            Util.arrayCopyNonAtomic(recvBuffer, (short)BIP32_OFFSET_PARENT_CHAINCODE, buffer, (short)0, BIP32_KEY_SIZE); 
+            clearBIP32DerivationState();
+            derivationStateCleared = true;
+                    
+            // compute the corresponding partial public key...
+            keyAgreement.init(bip32_extendedkey);
+            keyAgreement.generateSecret(Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_G, (short) 65, buffer, (short)33); //pubkey in uncompressed form
+            Util.setShort(buffer, BIP32_KEY_SIZE, BIP32_KEY_SIZE);
+            
+            // self-sign coordx
+            sigECDSA.init(bip32_extendedkey, Signature.MODE_SIGN);
+            short sign_size= sigECDSA.sign(buffer, (short)0, (short)(BIP32_KEY_SIZE+2+BIP32_KEY_SIZE), buffer, (short)(BIP32_KEY_SIZE+BIP32_KEY_SIZE+4));
+            Util.setShort(buffer, (short)(BIP32_KEY_SIZE+BIP32_KEY_SIZE+2), sign_size);
+            
+            // coordx signed by authentikey
+            sigECDSA.init(authentikey_private, Signature.MODE_SIGN);
+            short sign_size2= sigECDSA.sign(buffer, (short)0, (short)(BIP32_KEY_SIZE+BIP32_KEY_SIZE+sign_size+4), buffer, (short)(BIP32_KEY_SIZE+BIP32_KEY_SIZE+sign_size+6));
+            Util.setShort(buffer, (short)(BIP32_KEY_SIZE+BIP32_KEY_SIZE+sign_size+4), sign_size2);
+            
+            // return x-coordinate of public key+signatures
+            // the client can recover full public-key by guessing the compression value () and verifying the signature... 
+            // buffer=[chaincode(32) | coordx_size(2) | coordx | sign_size(2) | self-sign | sign_size(2) | auth_sign]
+            responseSize = (short)(BIP32_KEY_SIZE+BIP32_KEY_SIZE+sign_size+sign_size2+6);
+            success = true;
+            return responseSize;
+        } finally {
+            if (!derivationStateCleared)
+                clearBIP32DerivationState();
+            if (!success)
+                invalidateBIP32ExtendedKey();
+        }
         
     }// end of getBip32ExtendedKey()    
     
@@ -2448,8 +2500,11 @@ public class CardEdge extends javacard.framework.Applet {
                 }
                 
                 // set key & sign
-                if (key_nb==(byte)0xFF)
+                if (key_nb==(byte)0xFF) {
+                    if (!hasValidBIP32ExtendedKey())
+                        ISOException.throwIt(SW_INCORRECT_INITIALIZATION);
                     sigECDSA.init(bip32_extendedkey, Signature.MODE_SIGN);
+                }
                 else{
                     Key key= eckeys[key_nb];
                     // check type and size
@@ -2634,8 +2689,11 @@ public class CardEdge extends javacard.framework.Applet {
         }
         
         // hash+sign singlehash
-        if (key_nb==(byte)0xFF)
+        if (key_nb==(byte)0xFF) {
+            if (!hasValidBIP32ExtendedKey())
+                ISOException.throwIt(SW_INCORRECT_INITIALIZATION);
             sigECDSA.init(bip32_extendedkey, Signature.MODE_SIGN);
+        }
         else{
             Key key= eckeys[key_nb];
             // check type and size
@@ -2700,8 +2758,11 @@ public class CardEdge extends javacard.framework.Applet {
         }
         
         // hash+sign singlehash
-        if (key_nb==(byte)0xFF)
+        if (key_nb==(byte)0xFF) {
+            if (!hasValidBIP32ExtendedKey())
+                ISOException.throwIt(SW_INCORRECT_INITIALIZATION);
             sigECDSA.init(bip32_extendedkey, Signature.MODE_SIGN);
+        }
         else{
             Key key= eckeys[key_nb];
             // check type and size
