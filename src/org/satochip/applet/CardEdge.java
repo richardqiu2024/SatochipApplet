@@ -48,6 +48,7 @@
 package org.satochip.applet;
 
 import javacard.framework.APDU;
+import javacard.framework.CardRuntimeException;
 import javacard.framework.ISO7816;
 import javacard.framework.ISOException;
 import javacard.framework.JCSystem;
@@ -104,10 +105,12 @@ public class CardEdge extends javacard.framework.Applet {
     // 0.12-0.4: add reset to factory support
     // 0.12-0.5: add support for personalisation PKI
     // 0.12-0.6: patch spurious select issue
+    // 0.12-0.7: lazy Ed25519 initialization and debug status bytes
+    // 0.12-0.8: Ed25519 reuses recvBuffer on low-RAM cards, status reports buffer strategy
     private final static byte PROTOCOL_MAJOR_VERSION = (byte) 0; 
     private final static byte PROTOCOL_MINOR_VERSION = (byte) 12;
     private final static byte APPLET_MAJOR_VERSION = (byte) 0;
-    private final static byte APPLET_MINOR_VERSION = (byte) 6;
+    private final static byte APPLET_MINOR_VERSION = (byte) 10;
 
     // Maximum number of keys handled by the Cardlet
     private final static byte MAX_NUM_KEYS = (byte) 16;
@@ -167,6 +170,10 @@ public class CardEdge extends javacard.framework.Applet {
     private final static byte INS_SET_2FA_KEY = (byte) 0x79;    
     private final static byte INS_RESET_2FA_KEY = (byte) 0x78;
     private final static byte INS_SIGN_TRANSACTION_HASH= (byte) 0x7A;
+    private final static byte INS_ED25519_IMPORT_SEED = (byte) 0x7B;
+    private final static byte INS_ED25519_RESET_SEED = (byte) 0x7C;
+    private final static byte INS_ED25519_GET_PUBLIC_KEY = (byte) 0x7D;
+    private final static byte INS_ED25519_SIGN = (byte) 0x7E;
     
     // secure channel
     private final static byte INS_INIT_SECURE_CHANNEL = (byte) 0x81;
@@ -244,6 +251,14 @@ public class CardEdge extends javacard.framework.Applet {
     //private final static short SW_BIP32_UNINITIALIZED_AUTHENTIKEY_PUBKEY= (short) 0x9C16;
     /** Incorrect transaction hash */
     private final static short SW_INCORRECT_TXHASH = (short) 0x9C15;
+    /** Ed25519 seed is not initialized */
+    private final static short SW_ED25519_UNINITIALIZED_SEED = (short) 0x9C50;
+    /** Ed25519 seed is already initialized */
+    private final static short SW_ED25519_INITIALIZED_SEED = (short) 0x9C51;
+    /** Ed25519 derivation path must be hardened-only */
+    private final static short SW_ED25519_INVALID_PATH = (short) 0x9C52;
+    /** Ed25519 service is not available */
+    private final static short SW_ED25519_SERVICE_UNAVAILABLE = (short) 0x9C53;
     
     /** 2FA already initialized*/
     private final static short SW_2FA_INITIALIZED_KEY = (short) 0x9C18;
@@ -367,6 +382,15 @@ public class CardEdge extends javacard.framework.Applet {
     private AESKey bip32_masterchaincode; 
     private AESKey bip32_encryptkey; // used to encrypt sensitive data in object
     private ECPrivateKey bip32_extendedkey; // object storing last extended key used
+    
+    // Ed25519 / SLIP-0010 material
+    private boolean ed25519_seeded = false;
+    private AESKey ed25519_masterkey;
+    private AESKey ed25519_masterchaincode;
+    private Ed25519Service ed25519_service;
+    private boolean ed25519_service_ready = false;
+    private short ed25519_last_init_sw = (short) 0x0000;
+    private byte ed25519_init_attempts = (byte) 0x00;
     
     /*********************************************
      *               PKI objects                 *
@@ -552,6 +576,13 @@ public class CardEdge extends javacard.framework.Applet {
         bip32_encryptkey= (AESKey) KeyBuilder.buildKey(KeyBuilder.TYPE_AES, KeyBuilder.LENGTH_AES_128, false);
         randomData.generateData(recvBuffer, (short) 0, (short)16);
         bip32_encryptkey.setKey(recvBuffer, (short)0);
+
+        ed25519_masterkey = (AESKey) KeyBuilder.buildKey(KeyBuilder.TYPE_AES, KeyBuilder.LENGTH_AES_256, false);
+        ed25519_masterchaincode = (AESKey) KeyBuilder.buildKey(KeyBuilder.TYPE_AES, KeyBuilder.LENGTH_AES_256, false);
+        ed25519_service = null;
+        ed25519_service_ready = false;
+        ed25519_last_init_sw = (short) 0x0000;
+        ed25519_init_attempts = (byte) 0x00;
         
         // private key array
         eckeys = new Key[MAX_NUM_KEYS];
@@ -588,6 +619,8 @@ public class CardEdge extends javacard.framework.Applet {
         
         //todo: clear secure channel values?
         initialized_secure_channel=false;
+        if (ed25519_service_ready && ed25519_service != null)
+            ed25519_service.afterReset();
         
         return true;
     }
@@ -765,6 +798,18 @@ public class CardEdge extends javacard.framework.Applet {
             break;
         case INS_SIGN_TRANSACTION_HASH:
             sizeout= SignTransactionHash(apdu, buffer);
+            break;
+        case INS_ED25519_IMPORT_SEED:
+            sizeout = importEd25519Seed(apdu, buffer);
+            break;
+        case INS_ED25519_RESET_SEED:
+            sizeout = resetEd25519Seed(apdu, buffer);
+            break;
+        case INS_ED25519_GET_PUBLIC_KEY:
+            sizeout = getEd25519PublicKey(apdu, buffer);
+            break;
+        case INS_ED25519_SIGN:
+            sizeout = signEd25519(apdu, buffer);
             break;
         case INS_PARSE_TRANSACTION:
             sizeout= ParseTransaction(apdu, buffer);
@@ -1057,6 +1102,7 @@ public class CardEdge extends javacard.framework.Applet {
         
         //seed
         resetSeed();
+        resetEd25519SeedData();
         
         // private keys
         if (tmpkey != null){tmpkey.clearKey();}    
@@ -1091,6 +1137,50 @@ public class CardEdge extends javacard.framework.Applet {
             Util.arrayFillNonAtomic(trusted_pubkey, (short) 0, PUBKEY_SIZE, (byte) 0x00);
         }
         return true;
+    }
+
+    private boolean resetEd25519SeedData() {
+        ed25519_seeded = false;
+        ed25519_masterkey.clearKey();
+        ed25519_masterchaincode.clearKey();
+        clearEd25519WorkState();
+        return true;
+    }
+
+    private void ensureEd25519Service() {
+        if (ed25519_service_ready && ed25519_service != null)
+            return;
+
+        ed25519_init_attempts++;
+        try {
+            ed25519_service = new Ed25519Service(recvBuffer);
+            ed25519_service_ready = true;
+            ed25519_last_init_sw = ISO7816.SW_NO_ERROR;
+        } catch (CardRuntimeException e) {
+            ed25519_service = null;
+            ed25519_service_ready = false;
+            ed25519_last_init_sw = e.getReason();
+            ISOException.throwIt(e.getReason());
+        } catch (Exception e) {
+            ed25519_service = null;
+            ed25519_service_ready = false;
+            ed25519_last_init_sw = SW_ED25519_SERVICE_UNAVAILABLE;
+            ISOException.throwIt(SW_ED25519_SERVICE_UNAVAILABLE);
+        }
+    }
+
+    private void loadEd25519PathToService(byte[] pathBuffer, short pathOffset, byte depth) {
+        ensureEd25519Service();
+        ed25519_masterkey.getKey(recvBuffer, (short) 0);
+        ed25519_masterchaincode.getKey(recvBuffer, Slip10Ed25519.KEY_SIZE);
+        Slip10Ed25519.derivePath(recvBuffer, (short) 0, pathBuffer, pathOffset, depth);
+        ed25519_service.loadSeed(recvBuffer, (short) 0);
+    }
+
+    private void clearEd25519WorkState() {
+        Util.arrayFillNonAtomic(recvBuffer, (short) 0, Ed25519Service.REQUIRED_WORK_BUFFER_SIZE, (byte) 0x00);
+        if (ed25519_service_ready && ed25519_service != null)
+            ed25519_service.clearWorkingState();
     }
     
     /****************************************
@@ -1535,7 +1625,10 @@ public class CardEdge extends javacard.framework.Applet {
      *  p1: 0x00 
      *  p2: 0x00 
      *  data: none
-     *  return: [versions(4b) | PIN0-PUK0-PIN1-PUK1 tries (4b) | needs2FA (1b) | is_seeded(1b) | setupDone(1b) | needs_secure_channel(1b)]
+     *  return: [versions(4b) | PIN0-PUK0-PIN1-PUK1 tries (4b) | needs2FA (1b) | is_seeded(1b) | setupDone(1b) | needs_secure_channel(1b)
+     *           | NFC policy(1b) | feature_schnorr(1b) | feature_nostr(1b) | feature_liquid(1b)
+     *           | ed25519_service_ready(1b) | ed25519_seeded(1b) | ed25519_last_init_sw(2b) | ed25519_init_attempts(1b)
+     *           | ed25519_allocator_strategy(1b) | ed25519_buffer_strategy(1b)]
      */
     private short GetStatus(APDU apdu, byte[] buffer) {
         // check that PIN[0] has been entered previously
@@ -1580,6 +1673,18 @@ public class CardEdge extends javacard.framework.Applet {
             buffer[pos++] = (byte)0x01;
         else
             buffer[pos++] = (byte)0x00;
+        // Keep compatibility with newer host software that may already parse these policy bytes.
+        buffer[pos++] = (byte) 0x00; // nfc_policy
+        buffer[pos++] = (byte) 0x00; // feature_schnorr_policy
+        buffer[pos++] = (byte) 0x00; // feature_nostr_policy
+        buffer[pos++] = (byte) 0x00; // feature_liquid_policy
+        buffer[pos++] = ed25519_service_ready ? (byte) 0x01 : (byte) 0x00;
+        buffer[pos++] = ed25519_seeded ? (byte) 0x01 : (byte) 0x00;
+        Util.setShort(buffer, pos, ed25519_last_init_sw);
+        pos += (short) 2;
+        buffer[pos++] = ed25519_init_attempts;
+        buffer[pos++] = Ed25519Service.getAllocatorStrategyCode();
+        buffer[pos++] = Ed25519Service.getWorkBufferStrategyCode();
         
         return pos;
     }
@@ -1633,6 +1738,189 @@ public class CardEdge extends javacard.framework.Applet {
         }// end switch()
 
         return (short) 0;
+    }
+
+    /**
+     * Imports a master seed for SLIP-0010 Ed25519 derivation.
+     *
+     * ins: 0x7B
+     * p1: seed_size
+     * p2: 0x00
+     * data: [seed_data]
+     * return: [pubkey_size(2b) | pubkey(32b)]
+     */
+    private short importEd25519Seed(APDU apdu, byte[] buffer) {
+        if (!pins[0].isValidated())
+            ISOException.throwIt(SW_UNAUTHORIZED);
+        if (buffer[ISO7816.OFFSET_P2] != (byte) 0x00)
+            ISOException.throwIt(SW_INCORRECT_P2);
+        if (ed25519_seeded)
+            ISOException.throwIt(SW_ED25519_INITIALIZED_SEED);
+        ensureEd25519Service();
+
+        short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
+        short seedSize = (short) (buffer[ISO7816.OFFSET_P1] & 0xFF);
+        if (seedSize < (short) 16 || seedSize > (short) 64 || bytesLeft != seedSize)
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+
+        Slip10Ed25519.deriveMaster(buffer, ISO7816.OFFSET_CDATA, seedSize, recvBuffer, (short) 0);
+        ed25519_masterkey.setKey(recvBuffer, (short) 0);
+        ed25519_masterchaincode.setKey(recvBuffer, Slip10Ed25519.KEY_SIZE);
+        ed25519_seeded = true;
+
+        ed25519_service.loadSeed(recvBuffer, (short) 0);
+        short pubkeySize = ed25519_service.getPublicKey(buffer, (short) 2);
+        Util.setShort(buffer, (short) 0, pubkeySize);
+        clearEd25519WorkState();
+        return (short) (pubkeySize + 2);
+    }
+
+    /**
+     * Resets the Ed25519 seed. The PIN must be supplied in clear inside the
+     * secure channel, mirroring the existing BIP32 reset flow.
+     *
+     * ins: 0x7C
+     * p1: PIN_size
+     * p2: 0x00
+     * data: [PIN | optional-hmac(20b)]
+     * return: (none)
+     */
+    private short resetEd25519Seed(APDU apdu, byte[] buffer) {
+        if (buffer[ISO7816.OFFSET_P2] != (byte) 0x00)
+            ISOException.throwIt(SW_INCORRECT_P2);
+
+        short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
+        byte pin_size = buffer[ISO7816.OFFSET_P1];
+        OwnerPIN pin = pins[(byte) 0x00];
+        if (bytesLeft < pin_size)
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        if (!CheckPINPolicy(buffer, ISO7816.OFFSET_CDATA, pin_size))
+            ISOException.throwIt(SW_INVALID_PARAMETER);
+
+        byte triesRemaining = pin.getTriesRemaining();
+        if (triesRemaining == (byte) 0x00)
+            ISOException.throwIt(SW_IDENTITY_BLOCKED);
+        if (!pin.check(buffer, (short) ISO7816.OFFSET_CDATA, pin_size)) {
+            LogoutIdentity((byte) 0x00);
+            ISOException.throwIt((short) (SW_PIN_FAILED + triesRemaining - 1));
+        }
+
+        if (!ed25519_seeded)
+            ISOException.throwIt(SW_ED25519_UNINITIALIZED_SEED);
+
+        short hmacOffset = (short) (ISO7816.OFFSET_CDATA + pin_size);
+        bytesLeft -= pin_size;
+        if (needs_2FA) {
+            if (bytesLeft != (short) 20)
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+
+            authentikey_public.getW(recvBuffer, (short) 0);
+            Util.arrayFillNonAtomic(recvBuffer, (short) 33, (short) 32, (byte) 0xFF);
+            HmacSha160.computeHmacSha160(data2FA, OFFSET_2FA_HMACKEY, (short) 20, recvBuffer, (short) 1, (short) 64, recvBuffer, (short) 65);
+            if (Util.arrayCompare(buffer, hmacOffset, recvBuffer, (short) 65, (short) 20) != 0)
+                ISOException.throwIt(SW_SIGNATURE_INVALID);
+        } else if (bytesLeft != (short) 0) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+
+        resetEd25519SeedData();
+        LogOutAll();
+        return (short) 0;
+    }
+
+    /**
+     * Derives an Ed25519 public key from a hardened-only SLIP-0010 path.
+     *
+     * ins: 0x7D
+     * p1: path depth
+     * p2: 0x00
+     * data: [path indexes, 4 bytes per level]
+     * return: [pubkey_size(2b) | pubkey(32b)]
+     */
+    private short getEd25519PublicKey(APDU apdu, byte[] buffer) {
+        if (!pins[0].isValidated())
+            ISOException.throwIt(SW_UNAUTHORIZED);
+        if (buffer[ISO7816.OFFSET_P2] != (byte) 0x00)
+            ISOException.throwIt(SW_INCORRECT_P2);
+        if (!ed25519_seeded)
+            ISOException.throwIt(SW_ED25519_UNINITIALIZED_SEED);
+        ensureEd25519Service();
+
+        byte depth = buffer[ISO7816.OFFSET_P1];
+        short depthValue = (short) (depth & 0xFF);
+        short pathSize = (short) (depthValue * 4);
+        short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
+        if (depthValue > Slip10Ed25519.MAX_PATH_DEPTH)
+            ISOException.throwIt(SW_INCORRECT_P1);
+        if (bytesLeft != pathSize)
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        if (!Slip10Ed25519.isHardenedPath(buffer, ISO7816.OFFSET_CDATA, depth))
+            ISOException.throwIt(SW_ED25519_INVALID_PATH);
+
+        loadEd25519PathToService(buffer, ISO7816.OFFSET_CDATA, depth);
+        short pubkeySize = ed25519_service.getPublicKey(buffer, (short) 2);
+        Util.setShort(buffer, (short) 0, pubkeySize);
+        clearEd25519WorkState();
+        return (short) (pubkeySize + 2);
+    }
+
+    /**
+     * Signs an arbitrary payload with a derived Ed25519 key.
+     *
+     * ins: 0x7E
+     * p1: path depth
+     * p2: 0x00
+     * data: [path indexes | msg_size(2b) | msg | optional-hmac(20b)]
+     * return: [sig_size(2b) | sig(64b)]
+     */
+    private short signEd25519(APDU apdu, byte[] buffer) {
+        if (!pins[0].isValidated())
+            ISOException.throwIt(SW_UNAUTHORIZED);
+        if (buffer[ISO7816.OFFSET_P2] != (byte) 0x00)
+            ISOException.throwIt(SW_INCORRECT_P2);
+        if (!ed25519_seeded)
+            ISOException.throwIt(SW_ED25519_UNINITIALIZED_SEED);
+        ensureEd25519Service();
+
+        byte depth = buffer[ISO7816.OFFSET_P1];
+        short depthValue = (short) (depth & 0xFF);
+        short pathSize = (short) (depthValue * 4);
+        short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
+        if (depthValue > Slip10Ed25519.MAX_PATH_DEPTH)
+            ISOException.throwIt(SW_INCORRECT_P1);
+        if (bytesLeft < (short) (pathSize + 2))
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        if (!Slip10Ed25519.isHardenedPath(buffer, ISO7816.OFFSET_CDATA, depth))
+            ISOException.throwIt(SW_ED25519_INVALID_PATH);
+
+        short msgSizeOffset = (short) (ISO7816.OFFSET_CDATA + pathSize);
+        short msgOffset = (short) (msgSizeOffset + 2);
+        short msgSize = Util.getShort(buffer, msgSizeOffset);
+        bytesLeft -= (short) (pathSize + 2);
+        if (msgSize < 0 || bytesLeft < msgSize)
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+
+        short hmacOffset = (short) (msgOffset + msgSize);
+        bytesLeft -= msgSize;
+        if (needs_2FA) {
+            if (bytesLeft != (short) 20)
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+
+            sha256.reset();
+            sha256.doFinal(buffer, msgOffset, msgSize, recvBuffer, (short) 0);
+            Util.arrayFillNonAtomic(recvBuffer, (short) 32, (short) 32, (byte) 0xCC);
+            HmacSha160.computeHmacSha160(data2FA, OFFSET_2FA_HMACKEY, (short) 20, recvBuffer, (short) 0, (short) 64, recvBuffer, (short) 64);
+            if (Util.arrayCompare(buffer, hmacOffset, recvBuffer, (short) 64, (short) 20) != 0)
+                ISOException.throwIt(SW_SIGNATURE_INVALID);
+        } else if (bytesLeft != (short) 0) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+
+        loadEd25519PathToService(buffer, ISO7816.OFFSET_CDATA, depth);
+        short signatureSize = ed25519_service.sign(buffer, msgOffset, msgSize, buffer, (short) 2);
+        Util.setShort(buffer, (short) 0, signatureSize);
+        clearEd25519WorkState();
+        return (short) (signatureSize + 2);
     }
 
     

@@ -97,6 +97,19 @@ git submodule add https://github.com/martinpaljak/oracle_javacard_sdks sdks
 
 The .cap file should build in the SatochipApplet folder.
 
+## Integration notes
+
+The current branch also contains Ed25519 and SLIP-0010 integration work that was validated on a real card.
+
+Detailed notes for this branch are recorded in:
+
+- `docs/ED25519_INTEGRATION.md`
+
+Relevant helper scripts:
+
+- `scripts/test_ed25519.py`
+- `scripts/test_satochip_regression.py`
+
 # load applet into card
 
 Once you have a CAP file, you have to download it on the chip card. You can use [GlobalPlatformPro](https://github.com/martinpaljak/GlobalPlatformPro) to do this:
@@ -141,4 +154,3 @@ This application is distributed under the GNU Affero General Public License vers
 
 Some parts of the code may be licensed under a different (MIT-like) license. 
 [Contact us](mailto:support@satochip.io) if you feel that some license combination is inappropriate.
-
