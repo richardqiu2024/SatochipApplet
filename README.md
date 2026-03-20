@@ -111,6 +111,34 @@ Relevant helper scripts:
 
 - `scripts/test_ed25519.py`
 - `scripts/test_satochip_regression.py`
+- `scripts/test_sensitive_failure_paths.py`
+- `scripts/run_realcard_pipeline.py`
+
+Additional branch notes:
+
+- `docs/ED25519_INTEGRATION.md`
+- `docs/WSL_DOCKER_JAVACARD_WORKFLOW.md`
+
+Recommended real-card validation entry point for this branch:
+
+```bash
+python3 scripts/run_realcard_pipeline.py \
+  --reader "ACS ACR1281 1S Dual Reader 00 01" \
+  --pin 123456 \
+  --setup \
+  --reset-before \
+  --debug \
+  --no-reference
+```
+
+This serial pipeline runs:
+
+- `ant`
+- `gp --uninstall/--install`
+- `scripts/test_satochip_regression.py`
+- `scripts/test_sensitive_failure_paths.py`
+
+Do not run multiple real-card scripts in parallel against the same reader.
 
 # load applet into card
 

@@ -382,6 +382,7 @@ public class CardEdge extends javacard.framework.Applet {
     private AESKey bip32_masterchaincode; 
     private AESKey bip32_encryptkey; // used to encrypt sensitive data in object
     private ECPrivateKey bip32_extendedkey; // object storing last extended key used
+    private boolean bip32_extendedkey_valid = false;
     
     // Ed25519 / SLIP-0010 material
     private boolean ed25519_seeded = false;
@@ -573,6 +574,7 @@ public class CardEdge extends javacard.framework.Applet {
         bip32_masterkey= (AESKey) KeyBuilder.buildKey(KeyBuilder.TYPE_AES, KeyBuilder.LENGTH_AES_256, false);
         bip32_masterchaincode= (AESKey) KeyBuilder.buildKey(KeyBuilder.TYPE_AES, KeyBuilder.LENGTH_AES_256, false);
         bip32_extendedkey= (ECPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_EC_FP_PRIVATE, LENGTH_EC_FP_256, false);
+        bip32_extendedkey_valid = false;
         bip32_encryptkey= (AESKey) KeyBuilder.buildKey(KeyBuilder.TYPE_AES, KeyBuilder.LENGTH_AES_128, false);
         randomData.generateData(recvBuffer, (short) 0, (short)16);
         bip32_encryptkey.setKey(recvBuffer, (short)0);
@@ -1016,6 +1018,7 @@ public class CardEdge extends javacard.framework.Applet {
 //        // object containing the current extended key
 //        bip32_extendedkey= (ECPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_EC_FP_PRIVATE, LENGTH_EC_FP_256, false);        
         Secp256k1.setCommonCurveParameters(bip32_extendedkey);
+        bip32_extendedkey_valid = false;
         // key used to recover public key from private TODO: remove?
         //bip32_pubkey= (ECPublicKey) KeyBuilder.buildKey(KeyBuilder.TYPE_EC_FP_PUBLIC, LENGTH_EC_FP_256, false);
         //Secp256k1.setCommonCurveParameters(bip32_pubkey);
@@ -1187,12 +1190,19 @@ public class CardEdge extends javacard.framework.Applet {
     }
 
     private void invalidateBIP32ExtendedKey() {
-        if (bip32_extendedkey != null)
+        bip32_extendedkey_valid = false;
+        if (bip32_extendedkey != null) {
             bip32_extendedkey.clearKey();
+            Secp256k1.setCommonCurveParameters(bip32_extendedkey);
+        }
+    }
+
+    private void validateBIP32ExtendedKey() {
+        bip32_extendedkey_valid = true;
     }
 
     private boolean hasValidBIP32ExtendedKey() {
-        return (bip32_extendedkey != null) && bip32_extendedkey.isInitialized();
+        return bip32_extendedkey_valid && (bip32_extendedkey != null) && bip32_extendedkey.isInitialized();
     }
 
     private void clearEd25519WorkState() {
@@ -2354,6 +2364,7 @@ public class CardEdge extends javacard.framework.Applet {
             // return x-coordinate of public key+signatures
             // the client can recover full public-key by guessing the compression value () and verifying the signature... 
             // buffer=[chaincode(32) | coordx_size(2) | coordx | sign_size(2) | self-sign | sign_size(2) | auth_sign]
+            validateBIP32ExtendedKey();
             responseSize = (short)(BIP32_KEY_SIZE+BIP32_KEY_SIZE+sign_size+sign_size2+6);
             success = true;
             return responseSize;
@@ -2423,8 +2434,12 @@ public class CardEdge extends javacard.framework.Applet {
         short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
         
         // check whether the seed is initialized
-        if (key_nb==(byte)0xFF && !bip32_seeded)
-            ISOException.throwIt(SW_BIP32_UNINITIALIZED_SEED);
+        if (key_nb==(byte)0xFF) {
+            if (!bip32_seeded)
+                ISOException.throwIt(SW_BIP32_UNINITIALIZED_SEED);
+            if (!hasValidBIP32ExtendedKey())
+                ISOException.throwIt(SW_INCORRECT_INITIALIZATION);
+        }
         
         short chunk_size, offset, recvOffset;
         switch(p2){
@@ -2656,8 +2671,12 @@ public class CardEdge extends javacard.framework.Applet {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         
         // check whether the seed is initialized
-        if (key_nb==(byte)0xFF && !bip32_seeded)
-            ISOException.throwIt(SW_BIP32_UNINITIALIZED_SEED);
+        if (key_nb==(byte)0xFF) {
+            if (!bip32_seeded)
+                ISOException.throwIt(SW_BIP32_UNINITIALIZED_SEED);
+            if (!hasValidBIP32ExtendedKey())
+                ISOException.throwIt(SW_INCORRECT_INITIALIZATION);
+        }
         
         // check doublehash value in buffer with cached singlehash value
         sha256.reset();
@@ -2737,8 +2756,12 @@ public class CardEdge extends javacard.framework.Applet {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         
         // check whether the seed is initialized
-        if (key_nb==(byte)0xFF && !bip32_seeded)
-            ISOException.throwIt(SW_BIP32_UNINITIALIZED_SEED);
+        if (key_nb==(byte)0xFF) {
+            if (!bip32_seeded)
+                ISOException.throwIt(SW_BIP32_UNINITIALIZED_SEED);
+            if (!hasValidBIP32ExtendedKey())
+                ISOException.throwIt(SW_INCORRECT_INITIALIZATION);
+        }
         
         // check 2FA if required
         if(needs_2FA){

@@ -22,6 +22,9 @@ Relevant sources:
 - [Slip10Ed25519.java](../src/org/satochip/applet/Slip10Ed25519.java)
 - [test_ed25519.py](../scripts/test_ed25519.py)
 - [test_satochip_regression.py](../scripts/test_satochip_regression.py)
+- [test_sensitive_failure_paths.py](../scripts/test_sensitive_failure_paths.py)
+- [run_realcard_pipeline.py](../scripts/run_realcard_pipeline.py)
+- [WSL_DOCKER_JAVACARD_WORKFLOW.md](./WSL_DOCKER_JAVACARD_WORKFLOW.md)
 
 ## Frozen baseline
 
@@ -160,6 +163,122 @@ Interpretation:
 - `PASS ed25519_smoke` means the integrated Ed25519 flow works.
 - `PASS bip32_postcheck_after_ed25519` means the Ed25519 service did not corrupt BIP32 state.
 
+### Failure-path security regression
+
+This branch also includes a dedicated regression for the sensitive-buffer cleanup and stale-key invalidation changes:
+
+```bash
+python3 scripts/test_sensitive_failure_paths.py \
+  --reader "ACS ACR1281 1S Dual Reader 00 01" \
+  --pin 123456 \
+  --setup \
+  --reset-before \
+  --debug
+```
+
+Or run it as part of the full real-card pipeline:
+
+```bash
+python3 scripts/run_realcard_pipeline.py \
+  --reader "ACS ACR1281 1S Dual Reader 00 01" \
+  --pin 123456 \
+  --setup \
+  --reset-before \
+  --debug \
+  --no-reference
+```
+
+What it covers:
+
+- protected commands sent outside the secure channel are rejected with `0x9C20`
+- `INS_PROCESS_SECURE_CHANNEL` rejects use before initialization with `0x9C21`
+- truncated secure-channel envelopes are rejected with `0x6700`
+- tampered secure-channel MAC is rejected with `0x9C23`
+- even or replayed secure-channel IV values are rejected with `0x9C22`
+- the secure channel remains usable after those failures
+- reselecting the applet invalidates the previous secure-channel session until a fresh handshake is performed
+- invalid-length `INS_BIP32_IMPORT_SEED` is rejected
+- signing with `key_nb = 0xFF` before `INS_BIP32_GET_EXTENDED_KEY` is rejected with `0x9C13`
+- `INS_SIGN_TRANSACTION` also rejects a missing temporary BIP32 extended key
+- `INS_SIGN_TRANSACTION_HASH` also rejects a missing temporary BIP32 extended key
+- a valid BIP32 derive still allows successful signing afterward
+- after a valid derive, `INS_SIGN_TRANSACTION` advances to the expected transaction-hash check
+- resetting and re-importing BIP32 seed does not preserve a stale cached temporary key
+- invalid-length `INS_ED25519_IMPORT_SEED` is rejected
+- malformed `INS_ED25519_SIGN` payload is rejected
+- Ed25519 public-key export and signing still work after the failed Ed25519 request
+
+Observed passing summary:
+
+```text
+Summary:
+  PASS secure_channel_rejects_raw_protected_command
+  PASS secure_channel_rejects_uninitialized_process
+  PASS secure_channel/setup/pin
+  PASS reset_before
+  PASS secure_channel_rejects_truncated_envelope
+  PASS secure_channel_rejects_wrong_mac
+  PASS secure_channel_rejects_even_iv
+  PASS secure_channel_recovers_after_tamper
+  PASS secure_channel_rejects_stale_session_after_reselect
+  PASS secure_channel_recovers_after_reselect
+  PASS bip32_import_rejects_bad_length
+  PASS bip32_sign_rejects_missing_extended_key
+  PASS bip32_tx_sign_rejects_missing_extended_key
+  PASS bip32_hash_sign_rejects_missing_extended_key
+  PASS bip32_sign_succeeds_after_derivation
+  PASS bip32_tx_sign_reaches_txhash_check_after_derivation
+  PASS bip32_reset_clears_cached_extended_key
+  PASS bip32_reset_clears_cached_extended_key_for_tx_sign
+  PASS ed25519_import_rejects_bad_length
+  PASS ed25519_sign_rejects_bad_length
+  PASS ed25519_recovers_after_failed_sign
+Result: PASS
+```
+
+This script does not directly read card RAM or EEPROM. Instead, it checks the externally visible invariants that matter for this hardening work:
+
+- no stale temporary BIP32 extended key can be reused after invalid or incomplete setup
+- Ed25519 failure paths do not poison the next valid request
+- secure-channel integrity and session-boundary failures do not leave the applet stuck in a bad state
+
+For the exact container command sequence used during validation, see [WSL_DOCKER_JAVACARD_WORKFLOW.md](./WSL_DOCKER_JAVACARD_WORKFLOW.md).
+
+## Sensitive buffer hardening
+
+The current branch hardens exception paths that use the shared `recvBuffer` work area.
+
+Files changed:
+
+- [CardEdge.java](../src/org/satochip/applet/CardEdge.java)
+
+Main changes:
+
+- `try/finally` cleanup was added to:
+  - `importBIP32Seed()`
+  - `getBIP32ExtendedKey()`
+  - `importEd25519Seed()`
+  - `getEd25519PublicKey()`
+  - `signEd25519()`
+- `bip32_extendedkey` is now explicitly invalidated on:
+  - `resetSeed()`
+  - failed `getBIP32ExtendedKey()`
+- BIP32 temporary-key validity is tracked explicitly instead of relying only on `ECPrivateKey.clearKey()`
+- signing with `key_nb = 0xFF` now requires a valid temporary derived key in:
+  - `signMessage()`
+  - `SignTransaction()`
+  - `SignTransactionHash()`
+
+Security intent:
+
+- sensitive BIP32 and Ed25519 scratch state is wiped even when the APDU exits via `ISOException`
+- stale cached temporary BIP32 private keys are not silently reused after failure or reset
+
+Important implementation note:
+
+- clearing `bip32_extendedkey` with `clearKey()` alone caused subsequent `INS_BIP32_GET_EXTENDED_KEY` operations to fail with `0x6F00` on the target card
+- the fix was to keep an explicit `bip32_extendedkey_valid` state bit and re-apply secp256k1 domain parameters when invalidating the key object
+
 ## Extended status bytes
 
 `INS_GET_STATUS` now includes Ed25519 debug bytes at the end of the response.
@@ -243,9 +362,7 @@ The work-buffer requirement is currently:
 
 Before committing or tagging this branch, run:
 
-1. `ant`
-2. `gp --install SatoChip-3.0.4.cap`
-3. `python3 scripts/test_ed25519.py ...`
-4. `python3 scripts/test_satochip_regression.py ...`
+1. `python3 scripts/run_realcard_pipeline.py --reader "ACS ACR1281 1S Dual Reader 00 01" --pin 123456 --setup --reset-before --debug --no-reference`
+2. If you need a focused Ed25519-only sanity check, run `python3 scripts/test_ed25519.py ...`
 
-Do not treat `Ed25519` as validated unless both the Ed25519-only smoke test and the combined regression test pass on the real card.
+Do not treat `Ed25519` as validated unless the serial real-card pipeline passes on the target card.
